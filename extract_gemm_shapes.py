@@ -1,66 +1,65 @@
-# This script extracts the shapes of GEMM operations from a PyTorch model's state dictionary
-# and classifies them based on their intended use (e.g., QKV projection, MLP, etc.).
-# It uses heuristics based on parameter names to classify the roles of the parameters.
-# The script then aggregates the shapes by their roles and prints the results.
-
-
-#!/usr/bin/env python
 import torch
-from transformers import AutoModelForCausalLM  # or use AutoModel if more appropriate
-from collections import defaultdict, Counter
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from collections import defaultdict
+import os
 
-def classify_layer(name: str) -> str:
-    """
-    Classify the role of a parameter based on its name.
-    This heuristic looks for common substrings used in transformer models.
-    """
-    lower_name = name.lower()
-    if any(token in lower_name for token in ["q_proj", "k_proj", "v_proj", "query", "key", "value"]):
-        return "QKV Projection"
-    elif "attn" in lower_name and "proj" in lower_name:
-        return "Attention Projection"
-    elif any(token in lower_name for token in ["mlp", "fc", "dense", "ffn"]):
-        return "MLP"
-    elif "emb" in lower_name:
-        return "Embedding"
-    elif "lm_head" in lower_name or "output" in lower_name:
-        return "Output"
-    else:
-        return "Other"
+# 🧠 Pick device (MPS, CUDA, or CPU)
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+elif torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
 
-def extract_and_aggregate_gemm_shapes(model):
-    """
-    Extracts GEMM shapes from the model's state dictionary.
-    For each 2D parameter (typically corresponding to linear layers used in GEMM operations),
-    classify its intended use (e.g. QKV Projection, MLP, etc.) and tally the shape counts.
-    
-    Returns:
-        A dict mapping each role (e.g. "QKV Projection", "MLP") to a Counter
-        that tallies the occurrences of each unique shape.
-    """
-    role_shapes = defaultdict(Counter)
-    for name, param in model.state_dict().items():
-        if param.ndim == 2:  # Likely used in GEMM operations (linear layers)
-            role = classify_layer(name)
-            role_shapes[role][tuple(param.shape)] += 1
-    return role_shapes
+# 📁 Local path to your Hugging Face-converted model
+model_path = "/Users/f7b/.hf/Llama3.2-1B"
 
-def main():
-    # Path to your locally downloaded model
-    model_path = "/Users/f7b/.hf/Llama3.2-1B"
-    
-    # Load the model; if your model is not a causal language model, consider using AutoModel instead
-    model = AutoModelForCausalLM.from_pretrained(model_path)
-    
-    # Extract and aggregate GEMM shapes by role
-    aggregated_shapes = extract_and_aggregate_gemm_shapes(model)
-    
-    # Print out the aggregated results with their potential roles
-    print("Aggregated GEMM shapes by inferred role:")
-    for role, shapes_counter in aggregated_shapes.items():
-        print(f"\nRole: {role}")
-        for shape, count in shapes_counter.items():
-            print(f"  Shape {shape}: {count} occurrence(s)")
+# ✅ Load tokenizer and model onto correct device
+tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+model = AutoModelForCausalLM.from_pretrained(
+    model_path, 
+    torch_dtype=torch.float16 if device.type != "cpu" else torch.float32, 
+    local_files_only=True)
+model.to(device)
+model.eval()
 
-if __name__ == '__main__':
-    main()
+# 📊 GEMM shape tracker
+gemm_shapes = defaultdict(int)
+
+# 🔍 Hook for tracking GEMM shapes in Linear layers
+def linear_hook(module, input, output):
+    try:
+        a = input[0]
+        b = module.weight
+
+        if a.dim() > 2:
+            a = a.view(-1, a.size(-1))  # Flatten [B, S, K] → [M, K]
+
+        M, K = a.shape
+        N = b.shape[0]
+        gemm_shapes[(M, N, K)] += 1
+    except Exception as e:
+        print(f"⚠️ Skipping layer due to error: {e}")
+
+# Register hooks
+hooks = []
+for module in model.modules():
+    if isinstance(module, torch.nn.Linear):
+        hooks.append(module.register_forward_hook(linear_hook))
+
+# 🧪 Dummy input for testing
+input_text = "The quick brown fox jumps over the lazy dog."
+inputs = tokenizer(input_text, return_tensors="pt").to(device)
+inputs = {k: v.to(device) for k, v in inputs.items()}
+
+with torch.no_grad():
+    _ = model(**inputs)
+
+# Remove hooks
+for h in hooks:
+    h.remove()
+
+# ✅ Print captured GEMM shapes
+print("\n✅ Observed GEMM shapes (M, N, K):")
+for shape, count in sorted(gemm_shapes.items(), key=lambda x: -x[1]):
+    print(f"{shape} used {count} time(s)")
