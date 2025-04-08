@@ -129,10 +129,17 @@ for (m, n, k) in shapes:
         scale_a = torch.tensor(1.0, device=device, dtype=torch.float32)
         scale_b = torch.tensor(1.0, device=device, dtype=torch.float32)
         with torch.inference_mode():
-            ms_fp8_scaled_mm_e5m2 = do_bench(
-                lambda: torch._scaled_mm(a_fp8_e5m2, b_fp8_e4m3, scale_a, scale_b),
-                warmup, repeats, device
-            )
+            try:
+                # Attempt the 2-argument call first.
+                ms_fp8_scaled_mm_e5m2 = do_bench(
+                    lambda: torch._scaled_mm(a_fp8_e5m2, b_fp8_e4m3),
+                    warmup, repeats, device)
+            except TypeError:
+                # Fallback to the 4-argument version if the PyTorch build supports it.
+                ms_fp8_scaled_mm_e5m2 = do_bench(
+                    lambda: torch._scaled_mm(a_fp8_e5m2, b_fp8_e4m3, scale_a, scale_b),
+                    warmup, repeats, device
+                )
         tflops_fp8_scaled_mm_e5m2 = nFLOPS / ms_fp8_scaled_mm_e5m2 * 1e-9
         time.sleep(timeout)
 
